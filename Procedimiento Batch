@@ -1,0 +1,142 @@
+# ------------------- Reemplazar desde la lectura del CSV -------------------
+
+# (comentario) Definir la ruta del archivo .csv en HDFS
+file_path = "hdfs://localhost:9000/Tarea3/casos_covid_colombia.csv"
+
+# (comentario) Leer el archivo CSV con encabezados, detección automática de esquema,
+# separador '|' y convertir cadenas "NULL" a valores nulos.
+df_raw = spark.read.format("csv") \
+    .option("header", "true") \
+    .option("inferSchema", "true") \
+    .option("sep", "|") \
+    .option("nullValue", "NULL") \
+    .option("mode", "DROPMALFORMED") \
+    .load(file_path)
+
+# Mostrar esquema y primeras filas (útil para el video)
+print("=== Esquema detectado (después de leer con sep='|') ===")
+df_raw.printSchema()
+print("=== Primeras 10 filas (para inspección) ===")
+df_raw.show(10, truncate=False)
+
+# Mostrar lista completa de columnas para decidir cuales usar
+print("=== Columnas del dataset ===")
+for i, c in enumerate(df_raw.columns):
+    print(i, c)
+
+# ------------------- Selección y renombrado de columnas de interés -------------------
+# (comentario) A partir de la inspección, elegimos las columnas más útiles.
+# Ajusta estos nombres si tu CSV tiene variaciones.
+# Ejemplo de nombres que suelen aparecer en el dataset:
+candidates = [
+    'fecha_reporte_web', 'id_de_caso', 'fecha_de_notificacion', 'departamento',
+    'ciudad_municipio', 'edad', 'unidad_medida', 'sexo', 'fuente_tipo_contagio',
+    'ubicacion', 'estado', 'pais_viajo_1_cod', 'fecha_diagnostico', 'fecha_recuperado'
+]
+
+# Filtramos sólo las columnas que existan realmente
+selected = [c for c in candidates if c in df_raw.columns]
+if not selected:
+    # Si no coincidió, toma las primeras 12 columnas para análisis rápido
+    selected = df_raw.columns[:12]
+
+print("Columnas seleccionadas para procesar:", selected)
+df = df_raw.select(*selected)
+
+# Renombrar columnas (hacer nombres más manejables)
+rename_map = {
+    'fecha_reporte_web': 'fecha_reporte_web',
+    'id_de_caso': 'id_caso',
+    'fecha_de_notificacion': 'fecha_notificacion',
+    'departamento': 'departamento',
+    'ciudad_municipio': 'ciudad_municipio',
+    'edad': 'edad',
+    'unidad_medida': 'unidad_medida',
+    'sexo': 'sexo',
+    'fuente_tipo_contagio': 'tipo_contagio',
+    'ubicacion': 'ubicacion',
+    'estado': 'estado',
+    'fecha_diagnostico': 'fecha_diagnostico',
+    'fecha_recuperado': 'fecha_recuperado'
+}
+for old, new in rename_map.items():
+    if old in df.columns and old != new:
+        df = df.withColumnRenamed(old, new)
+
+# ------------------- Limpieza de valores y tipos -------------------
+# (comentario) Reemplazar cadenas vacías por null y recortar espacios en campos string
+for c in df.columns:
+    df = df.withColumn(c, F.when(F.trim(F.col(c)) == "", None).otherwise(F.col(c)))
+    # aplicar trim a strings
+    df = df.withColumn(c, F.when(F.col(c).isNotNull() & (F.col(c).cast("string").isNotNull()),
+                                  F.trim(F.col(c))).otherwise(F.col(c)))
+
+# (comentario) Convertir 'edad' a integer si existe
+if 'edad' in df.columns:
+    df = df.withColumn('edad_int', F.col('edad').cast(IntegerType()))
+
+# (comentario) Convertir fechas: intentamos varios formatos comunes
+def safe_to_date(colname):
+    # intenta yyyy-MM-dd, luego yyyy-MM-dd HH:mm:ss, luego dd/MM/yyyy
+    return F.coalesce(
+        F.to_date(F.col(colname), 'yyyy-MM-dd'),
+        F.to_date(F.col(colname), 'yyyy-MM-dd HH:mm:ss'),
+        F.to_date(F.col(colname), 'dd/MM/yyyy')
+    )
+
+if 'fecha_diagnostico' in df.columns:
+    df = df.withColumn('fecha_diagnostico_date', safe_to_date('fecha_diagnostico'))
+if 'fecha_notificacion' in df.columns:
+    df = df.withColumn('fecha_notificacion_date', safe_to_date('fecha_notificacion'))
+if 'fecha_reporte_web' in df.columns:
+    # si trae tiempo, lo parseamos a timestamp y luego a fecha
+    df = df.withColumn('fecha_reporte_ts', F.to_timestamp('fecha_reporte_web', 'yyyy-MM-dd HH:mm:ss'))
+    df = df.withColumn('fecha_reporte_date',
+                       F.coalesce(F.to_date('fecha_reporte_ts'), safe_to_date('fecha_reporte_web')))
+
+# ------------------- Inspección post-limpieza -------------------
+print("=== Esquema después de limpieza y conversiones ===")
+df.printSchema()
+
+print("=== Primeras 10 filas (post-limpieza) ===")
+df.show(10, truncate=False)
+
+# Conteo total y conteo por departamento (top 15) — EDA básico
+total = df.count()
+print("=== Conteo total de registros (post-limpieza):", total)
+
+if 'departamento' in df.columns:
+    print("=== Top 15 departamentos por cantidad de registros ===")
+    df.groupBy('departamento').count().orderBy(F.desc('count')).show(15, truncate=False)
+
+# Series temporal: casos por fecha_diagnostico_date (top 20 fechas)
+if 'fecha_diagnostico_date' in df.columns:
+    ts = df.groupBy('fecha_diagnostico_date').count().orderBy('fecha_diagnostico_date')
+    print("=== Series: casos por fecha_diagnostico_date (primeras 20 filas) ===")
+    ts.show(20, truncate=False)
+    # Guardar esa serie temporal en HDFS como CSV para revisar/mostrar
+    ts.coalesce(1).write.mode('overwrite').option('header','true').csv("hdfs://localhost:9000/Tarea3/output/casos_por_fecha_csv")
+
+# ------------------- Guardar dataset procesado en Parquet y un sample local -------------------
+processed_path = "hdfs://localhost:9000/Tarea3/processed_parquet"
+df.write.mode('overwrite').parquet(processed_path)
+print(f"Datos procesados guardados en Parquet: {processed_path}")
+
+# Guardar una muestra pequeña localmente (para que la puedas abrir fácilmente y mostrar en video)
+sample_local = "/home/hadoop/tarea3_sample_50.csv"
+df.limit(50).coalesce(1).write.mode('overwrite').option('header','true').csv("file:///home/hadoop/tarea3_sample_50_temp")
+# mover/renombrar el part-... a nombre legible
+import glob, shutil, os
+temp_dir = "/home/hadoop/tarea3_sample_50_temp"
+csv_files = glob.glob(os.path.join(temp_dir, "part-*.csv"))
+if csv_files:
+    shutil.move(csv_files[0], sample_local)
+    # borrar el folder temporal
+    shutil.rmtree(temp_dir)
+    print(f"Muestra local guardada en: {sample_local}")
+else:
+    print("No se generó el CSV de muestra local.")
+
+# -----------------------------------------------------------------------
+# (comentario) Fin de la parte de lectura/limpieza/EDA/guardado
+# -----------------------------------------------------------------------
