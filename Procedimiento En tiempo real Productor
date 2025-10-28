@@ -1,0 +1,55 @@
+                                                                                           tarea3_producer_processed.py
+# -----------------------------------------------------------
+# tarea3_producer_processed.py
+# -----------------------------------------------------------
+# Objetivo: Leer el parquet procesado desde HDFS y enviarlo
+# progresivamente al tópico Kafka "covid_stream" simulando
+# la llegada de datos en tiempo real.
+# -----------------------------------------------------------
+
+from kafka import KafkaProducer
+import json
+import time
+from datetime import date, datetime
+from pyspark.sql import SparkSession
+
+# Crear sesión Spark
+spark = SparkSession.builder.appName("Tarea3_Producer_Processed").getOrCreate()
+
+# Ruta parquet procesado
+hdfs_path = "hdfs://localhost:9000/Tarea3/processed/parquet"
+
+# Leer el parquet procesado desde HDFS
+df = spark.read.parquet(hdfs_path)
+
+# Limitar opcionalmente para prueba
+records = [row.asDict() for row in df.limit(1000).collect()]
+
+# ---- Función para serializar fechas ----
+def default_serializer(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
+# Configurar productor Kafka
+producer = KafkaProducer(
+    bootstrap_servers=["localhost:9092"],
+    value_serializer=lambda v: json.dumps(v, default=default_serializer).encode("utf-8")
+)
+
+topic = "covid_stream"
+
+print(f"Enviando {len(records)} registros al tópico '{topic}' ...")
+
+# Enviar los registros simulando streaming (1 cada 0.5 segundos)
+for record in records:
+    producer.send(topic, value=record)
+    print("Enviado:", record)
+    time.sleep(0.5)
+
+producer.flush()
+producer.close()
+
+print("✅ Envío completo al tópico Kafka 'covid_stream'.")
+spark.stop()
+
