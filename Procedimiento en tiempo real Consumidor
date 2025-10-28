@@ -1,0 +1,82 @@
+# -----------------------------------------------------------
+# tarea3_streaming_processed.py
+# -----------------------------------------------------------
+# Objetivo: Consumir datos del tópico Kafka "covid_stream"
+# y procesarlos en tiempo real con Spark Structured Streaming.
+# -----------------------------------------------------------
+
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+# Crear sesión Spark con soporte Kafka
+spark = SparkSession.builder \
+    .appName("Tarea3_Streaming_Processed") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+# Configuración Kafka
+kafka_bootstrap = "localhost:9092"
+topic = "covid_stream"
+
+# Esquema esperado (basado en parquet procesado)
+schema = StructType([
+    StructField("id_de_caso", StringType(), True),
+    StructField("departamento", StringType(), True),
+    StructField("ciudad", StringType(), True),
+    StructField("edad_int", IntegerType(), True),
+    StructField("unidad_medida_int", IntegerType(), True),
+    StructField("sexo", StringType(), True),
+    StructField("fuente_tipo_contagio", StringType(), True),
+    StructField("ubicacion", StringType(), True),
+    StructField("estado", StringType(), True),
+    StructField("recuperado_norm", StringType(), True),
+    StructField("fecha_reporte_web_date", StringType(), True)
+])
+
+# Leer stream desde Kafka
+df_stream = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", kafka_bootstrap) \
+    .option("subscribe", topic) \
+    .option("startingOffsets", "latest") \
+    .load()
+
+# Los valores vienen en formato JSON (como string)
+df_parsed = df_stream.select(
+    F.from_json(F.col("value").cast("string"), schema).alias("data")
+).select("data.*")
+
+# -----------------------------------------------------------
+# Procesamiento en tiempo real
+# -----------------------------------------------------------
+
+# Conteo de casos por departamento (ventana de tiempo)
+dept_counts = df_parsed \
+    .groupBy("departamento") \
+    .count() \
+    .orderBy(F.desc("count"))
+
+# Conteo por sexo
+sexo_counts = df_parsed \
+    .groupBy("sexo") \
+    .count() \
+    .orderBy(F.desc("count"))
+
+# Mostrar resultados continuamente en consola
+query_dept = dept_counts.writeStream \
+    .outputMode("complete") \
+    .format("console") \
+    .option("truncate", "false") \
+    .option("numRows", 20) \
+    .start()
+
+query_sexo = sexo_counts.writeStream \
+    .outputMode("complete") \
+    .format("console") \
+    .option("truncate", "false") \
+    .option("numRows", 20) \
+    .start()
+
+# Esperar finalización (Ctrl+C para detener)
+spark.streams.awaitAnyTermination()
