@@ -1,142 +1,217 @@
-# ------------------- Reemplazar desde la lectura del CSV -------------------
+# tarea3_batch.py  (continuación / reemplazo lectura y procesamiento)
+# -----------------------------------------------------------
+# Objetivo: leer robustamente, limpiar, transformar, EDA y guardar resultados.
+# -----------------------------------------------------------
 
-# (comentario) Definir la ruta del archivo .csv en HDFS
-file_path = "hdfs://localhost:9000/Tarea3/casos_covid_colombia.csv"
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import IntegerType, DoubleType, TimestampType, DateType
+import sys
 
-# (comentario) Leer el archivo CSV con encabezados, detección automática de esquema,
-# separador '|' y convertir cadenas "NULL" a valores nulos.
-df_raw = spark.read.format("csv") \
+spark = SparkSession.builder \
+    .appName("Tarea3_Batch_CasosCOVID") \
+    .getOrCreate()
+
+# Ruta HDFS del CSV original
+file_path = "hdfs://localhost:9000/Tarea3/gt2j-8ykr.csv"
+
+# -------------------------
+# 1) Lectura robusta del CSV
+# Intentamos con coma (formato CSV estándar). Si el resultado tiene 1 columna
+# (indicando que el separador fue incorrecto), mostramos aviso y tratamos de limpiar.
+# -------------------------
+df_try = spark.read.format("csv") \
     .option("header", "true") \
     .option("inferSchema", "true") \
-    .option("sep", "|") \
-    .option("nullValue", "NULL") \
-    .option("mode", "DROPMALFORMED") \
+    .option("sep", ",") \
+    .option("quote", "\"") \
+    .option("escape", "\\") \
+    .option("multiLine", "false") \
+    .option("nullValue", "") \
     .load(file_path)
 
-# Mostrar esquema y primeras filas (útil para el video)
-print("=== Esquema detectado (después de leer con sep='|') ===")
+# Si se cargó todo en una sola columna (len == 1) — reintentamos con separación por pipe
+if len(df_try.columns) == 1:
+    print("Lectura inicial produjo una sola columna. Reintentando con separador '|' y opciones de quote.")
+    df_raw = spark.read.format("csv") \
+        .option("header", "true") \
+        .option("inferSchema", "true") \
+        .option("sep", "|") \
+        .option("quote", "\"") \
+        .option("escape", "\\") \
+        .option("multiLine", "false") \
+        .option("nullValue", "") \
+        .load(file_path)
+else:
+    df_raw = df_try
+
+# Mostrar esquema / primeras filas para inspección
+print("=== Esquema detectado ===")
 df_raw.printSchema()
-print("=== Primeras 10 filas (para inspección) ===")
+print("=== Muestra de filas ===")
 df_raw.show(10, truncate=False)
 
-# Mostrar lista completa de columnas para decidir cuales usar
-print("=== Columnas del dataset ===")
-for i, c in enumerate(df_raw.columns):
-    print(i, c)
+# -------------------------
+# 2) Normalizar nombres de columnas (quitar comillas, espacios, caracteres raros)
+# -------------------------
+def clean_col_name(c):
+    # elimina comillas dobles y espacios extremos y cambia espacios por guion bajo
+    return c.strip().replace('"', '').replace(' ', '_')
 
-# ------------------- Selección y renombrado de columnas de interés -------------------
-# (comentario) A partir de la inspección, elegimos las columnas más útiles.
-# Ajusta estos nombres si tu CSV tiene variaciones.
-# Ejemplo de nombres que suelen aparecer en el dataset:
-candidates = [
-    'fecha_reporte_web', 'id_de_caso', 'fecha_de_notificacion', 'departamento',
-    'ciudad_municipio', 'edad', 'unidad_medida', 'sexo', 'fuente_tipo_contagio',
-    'ubicacion', 'estado', 'pais_viajo_1_cod', 'fecha_diagnostico', 'fecha_recuperado'
+new_cols = [clean_col_name(c) for c in df_raw.columns]
+df = df_raw.toDF(*new_cols)
+
+print("=== Columnas limpias ===")
+print(df.columns)
+
+# -------------------------
+# 3) Transformaciones de tipo (fechas y numéricos)
+# Columnas de fecha detectadas (ajusta si los nombres difieren)
+# -------------------------
+# Lista de columnas de fecha esperadas en tu dataset original
+date_cols = [
+    "fecha_reporte_web",
+    "fecha_de_notificaci_n",
+    "fecha_inicio_sintomas",
+    "fecha_muerte",
+    "fecha_diagnostico",
+    "fecha_recuperado"
 ]
 
-# Filtramos sólo las columnas que existan realmente
-selected = [c for c in candidates if c in df_raw.columns]
-if not selected:
-    # Si no coincidió, toma las primeras 12 columnas para análisis rápido
-    selected = df_raw.columns[:12]
+# Formato de fecha en tus muestras: "2020-12-24 00:00:00"
+for c in date_cols:
+    if c in df.columns:
+        # Convertir a Timestamp (mantiene hora) y luego opcionalmente a Date si deseas sólo fecha
+        df = df.withColumn(c + "_ts", F.to_timestamp(F.col(c), "yyyy-MM-dd HH:mm:ss")) \
+               .withColumn(c + "_date", F.to_date(F.col(c + "_ts")))
+        # (opcional) borrar columna original string si lo deseas: .drop(c)
+    else:
+        print(f"Aviso: columna de fecha esperada no encontrada: {c}")
 
-print("Columnas seleccionadas para procesar:", selected)
-df = df_raw.select(*selected)
+# Convertir edad y unidad_medida a enteros si existen
+if "edad" in df.columns:
+    df = df.withColumn("edad_int", F.col("edad").cast(IntegerType()))
+if "unidad_medida" in df.columns:
+    df = df.withColumn("unidad_medida_int", F.col("unidad_medida").cast(IntegerType()))
 
-# Renombrar columnas (hacer nombres más manejables)
-rename_map = {
-    'fecha_reporte_web': 'fecha_reporte_web',
-    'id_de_caso': 'id_caso',
-    'fecha_de_notificacion': 'fecha_notificacion',
-    'departamento': 'departamento',
-    'ciudad_municipio': 'ciudad_municipio',
-    'edad': 'edad',
-    'unidad_medida': 'unidad_medida',
-    'sexo': 'sexo',
-    'fuente_tipo_contagio': 'tipo_contagio',
-    'ubicacion': 'ubicacion',
-    'estado': 'estado',
-    'fecha_diagnostico': 'fecha_diagnostico',
-    'fecha_recuperado': 'fecha_recuperado'
-}
-for old, new in rename_map.items():
-    if old in df.columns and old != new:
-        df = df.withColumnRenamed(old, new)
+# -------------------------
+# 4) Limpieza de valores categóricos y nulos
+# - Normalizar sexo (mayúscula)
+# - Limpiar espacios en departamento, ciudad
+# - Reemplazar cadenas vacías por null
+# -------------------------
+# trim a varias columnas de texto
+text_cols = [c for c, t in df.dtypes if t.startswith("string")]
+for c in text_cols:
+    df = df.withColumn(c, F.when(F.trim(F.col(c)) == "", None).otherwise(F.trim(F.col(c))))
 
-# ------------------- Limpieza de valores y tipos -------------------
-# (comentario) Reemplazar cadenas vacías por null y recortar espacios en campos string
-for c in df.columns:
-    df = df.withColumn(c, F.when(F.trim(F.col(c)) == "", None).otherwise(F.col(c)))
-    # aplicar trim a strings
-    df = df.withColumn(c, F.when(F.col(c).isNotNull() & (F.col(c).cast("string").isNotNull()),
-                                  F.trim(F.col(c))).otherwise(F.col(c)))
+# Normalizar sexo
+if "sexo" in df.columns:
+    df = df.withColumn("sexo", F.upper(F.col("sexo")))
 
-# (comentario) Convertir 'edad' a integer si existe
-if 'edad' in df.columns:
-    df = df.withColumn('edad_int', F.col('edad').cast(IntegerType()))
+# Manejo de columna 'recuperado' o 'estado' si existen — unificar posibles variantes
+if "recuperado" in df.columns:
+    df = df.withColumn("recuperado_norm", F.when(F.col("recuperado").isin("Recuperado", "recuperado", "RECUPERADO", "Si", "S"), "Si")
+                                            .when(F.col("recuperado").isNull(), None)
+                                            .otherwise(F.col("recuperado")))
 
-# (comentario) Convertir fechas: intentamos varios formatos comunes
-def safe_to_date(colname):
-    # intenta yyyy-MM-dd, luego yyyy-MM-dd HH:mm:ss, luego dd/MM/yyyy
-    return F.coalesce(
-        F.to_date(F.col(colname), 'yyyy-MM-dd'),
-        F.to_date(F.col(colname), 'yyyy-MM-dd HH:mm:ss'),
-        F.to_date(F.col(colname), 'dd/MM/yyyy')
-    )
+# -------------------------
+# 5) Columnas finales: seleccionar/renombrar las columnas útiles
+# Ajusta la lista según lo que quieras guardar
+# -------------------------
+selected_cols = [
+    "id_de_caso" if "id_de_caso" in df.columns else "id_de_caso",
+    "departamento_nom" if "departamento_nom" in df.columns else "departamento",
+    "ciudad_municipio_nom" if "ciudad_municipio_nom" in df.columns else "ciudad_municipio",
+    "edad_int",
+    "unidad_medida_int",
+    "sexo",
+    "fuente_tipo_contagio" if "fuente_tipo_contagio" in df.columns else "fuente_tipo_contagio",
+    "ubicacion" if "ubicacion" in df.columns else "ubicacion",
+    "estado" if "estado" in df.columns else "estado",
+    "recuperado_norm",
+]
 
-if 'fecha_diagnostico' in df.columns:
-    df = df.withColumn('fecha_diagnostico_date', safe_to_date('fecha_diagnostico'))
-if 'fecha_notificacion' in df.columns:
-    df = df.withColumn('fecha_notificacion_date', safe_to_date('fecha_notificacion'))
-if 'fecha_reporte_web' in df.columns:
-    # si trae tiempo, lo parseamos a timestamp y luego a fecha
-    df = df.withColumn('fecha_reporte_ts', F.to_timestamp('fecha_reporte_web', 'yyyy-MM-dd HH:mm:ss'))
-    df = df.withColumn('fecha_reporte_date',
-                       F.coalesce(F.to_date('fecha_reporte_ts'), safe_to_date('fecha_reporte_web')))
+# Filtrar selected real (solo las que existen)
+selected_cols = [c for c in selected_cols if c in df.columns]
 
-# ------------------- Inspección post-limpieza -------------------
-print("=== Esquema después de limpieza y conversiones ===")
-df.printSchema()
+# añadir algunas fechas parseadas si existen
+for c in date_cols:
+    c_date = c + "_date"
+    if c_date in df.columns:
+        selected_cols.append(c_date)
 
-print("=== Primeras 10 filas (post-limpieza) ===")
-df.show(10, truncate=False)
+df_processed = df.select(*selected_cols).withColumnRenamed("departamento_nom", "departamento") \
+                                           .withColumnRenamed("ciudad_municipio_nom", "ciudad")
 
-# Conteo total y conteo por departamento (top 15) — EDA básico
-total = df.count()
-print("=== Conteo total de registros (post-limpieza):", total)
+print("=== Esquema final procesado ===")
+df_processed.printSchema()
+print("=== Muestra procesada ===")
+df_processed.show(10, truncate=False)
 
-if 'departamento' in df.columns:
-    print("=== Top 15 departamentos por cantidad de registros ===")
-    df.groupBy('departamento').count().orderBy(F.desc('count')).show(15, truncate=False)
-
-# Series temporal: casos por fecha_diagnostico_date (top 20 fechas)
-if 'fecha_diagnostico_date' in df.columns:
-    ts = df.groupBy('fecha_diagnostico_date').count().orderBy('fecha_diagnostico_date')
-    print("=== Series: casos por fecha_diagnostico_date (primeras 20 filas) ===")
-    ts.show(20, truncate=False)
-    # Guardar esa serie temporal en HDFS como CSV para revisar/mostrar
-    ts.coalesce(1).write.mode('overwrite').option('header','true').csv("hdfs://localhost:9000/Tarea3/output/casos_por_fecha_csv")
-
-# ------------------- Guardar dataset procesado en Parquet y un sample local -------------------
-processed_path = "hdfs://localhost:9000/Tarea3/processed_parquet"
-df.write.mode('overwrite').parquet(processed_path)
-print(f"Datos procesados guardados en Parquet: {processed_path}")
-
-# Guardar una muestra pequeña localmente (para que la puedas abrir fácilmente y mostrar en video)
-sample_local = "/home/hadoop/tarea3_sample_50.csv"
-df.limit(50).coalesce(1).write.mode('overwrite').option('header','true').csv("file:///home/hadoop/tarea3_sample_50_temp")
-# mover/renombrar el part-... a nombre legible
-import glob, shutil, os
-temp_dir = "/home/hadoop/tarea3_sample_50_temp"
-csv_files = glob.glob(os.path.join(temp_dir, "part-*.csv"))
-if csv_files:
-    shutil.move(csv_files[0], sample_local)
-    # borrar el folder temporal
-    shutil.rmtree(temp_dir)
-    print(f"Muestra local guardada en: {sample_local}")
+# -------------------------
+# 6) Análisis exploratorio rápido (EDA)
+# Guardamos algunas métricas/aggregados útiles.
+# -------------------------
+# 6.1 Conteo por departamento
+if "departamento" in df_processed.columns:
+    dept_counts = df_processed.groupBy("departamento").count().orderBy(F.desc("count"))
+    print("=== Top 20 departamentos por número de casos ===")
+    dept_counts.show(20, truncate=False)
 else:
-    print("No se generó el CSV de muestra local.")
+    dept_counts = None
+    print("Columna 'departamento' no encontrada para EDA.")
 
-# -----------------------------------------------------------------------
-# (comentario) Fin de la parte de lectura/limpieza/EDA/guardado
-# -----------------------------------------------------------------------
+# 6.2 Conteo por sexo
+if "sexo" in df_processed.columns:
+    sexo_counts = df_processed.groupBy("sexo").count().orderBy(F.desc("count"))
+    print("=== Conteo por sexo ===")
+    sexo_counts.show(truncate=False)
+else:
+    sexo_counts = None
+
+# 6.3 Conteo por estado (p.ej. 'Leve','Fallecido','Grave', etc.)
+if "estado" in df_processed.columns:
+    estado_counts = df_processed.groupBy("estado").count().orderBy(F.desc("count"))
+    print("=== Conteo por estado ===")
+    estado_counts.show(truncate=False)
+else:
+    estado_counts = None
+
+# 6.4 Estadísticas de edad
+if "edad_int" in df_processed.columns:
+    edad_stats = df_processed.select(
+        F.count("edad_int").alias("n"),
+        F.mean("edad_int").alias("edad_media"),
+        F.stddev("edad_int").alias("edad_std"),
+        F.min("edad_int").alias("edad_min"),
+        F.max("edad_int").alias("edad_max")
+    )
+    print("=== Estadísticas de edad ===")
+    edad_stats.show(truncate=False)
+else:
+    edad_stats = None
+
+# -------------------------
+# 7) Guardar resultados procesados en HDFS
+# - Data procesada -> Parquet (eficiente para Spark)
+# - Resúmenes EDA -> CSV para consulta rápida
+# -------------------------
+out_base = "hdfs://localhost:9000/Tarea3/processed"
+
+# Guardar parquet (sobrescribe si existe)
+df_processed.write.mode("overwrite").parquet(out_base + "/parquet")
+
+# Guardar agregados EDA si existen
+if dept_counts is not None:
+    dept_counts.coalesce(1).write.mode("overwrite").option("header", "true").csv(out_base + "/eda/departamento_counts")
+if sexo_counts is not None:
+    sexo_counts.coalesce(1).write.mode("overwrite").option("header", "true").csv(out_base + "/eda/sexo_counts")
+if estado_counts is not None:
+    estado_counts.coalesce(1).write.mode("overwrite").option("header", "true").csv(out_base + "/eda/estado_counts")
+if edad_stats is not None:
+    edad_stats.coalesce(1).write.mode("overwrite").option("header", "true").csv(out_base + "/eda/edad_stats")
+
+print("Guardado completado en HDFS en:", out_base)
+
+# Fin de script
+spark.stop()
